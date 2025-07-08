@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Agentic Portfolio Advisor</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    #chat { border: 1px solid #ccc; padding: 1rem; height: 60vh; overflow-y: auto; }
+    .message { margin: 0.5rem 0; }
+    .you { color: #0066cc; }
+    .bot { color: #000; }
+    input { width: 60%; padding: 0.5rem; font-size: 1rem; }
+    button { padding: 0.5rem 1rem; margin-left: 0.5rem; }
+    #recommend { display: none; background: #28a745; color: white; border: none; }
+    #reset     { background: #dc3545; color: white; border: none; display: inline-block; }
+  </style>
+</head>
+<body>
+  <h1>Agentic Portfolio Advisor</h1>
+  <div id="chat"></div>
+  <div>
+    <input id="input" placeholder="Type your answer…" autocomplete="off" />
+    <button id="send">Send</button>
+    <button id="recommend">Get Recommendation</button>
+    <button id="reset">Restart Intake</button>
+  </div>
+
+  <script>
+    const chatDiv = document.getElementById('chat');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const recBtn  = document.getElementById('recommend');
+    const rstBtn  = document.getElementById('reset');
+
+    // generate or reuse a session ID
+    let sessionId = localStorage.getItem('sessionId');
+    if (!sessionId) {
+      sessionId = crypto.randomUUID();
+      localStorage.setItem('sessionId', sessionId);
+    }
+
+    function appendMessage(text, cls) {
+      const p = document.createElement('p');
+      p.className = 'message ' + cls;
+      p.innerHTML = text;
+      chatDiv.appendChild(p);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    async function sendToAgent(userInput) {
+      if (userInput) appendMessage(`<strong>You:</strong> ${userInput}`, 'you');
+
+      const payload = userInput == null
+        ? { session_id: sessionId }
+        : { session_id: sessionId, user_input: userInput };
+
+      const res  = await fetch('/agent/intake', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const json = await res.json();
+      appendMessage(`<strong>Advisor:</strong> ${json.response}`, 'bot');
+
+      // once intake is complete, show recommendation button
+      if (json.response.startsWith('✅')) {
+        recBtn.style.display = 'inline-block';
+      }
+    }
+
+    async function getRecommendation() {
+      appendMessage(`<em>Fetching recommendation…</em>`, 'bot');
+      const res  = await fetch('/agent/recommend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const json = await res.json();
+      appendMessage(
+        `<strong>Advisor Recommendation:</strong><br>${json.recommendation}`,
+        'bot'
+      );
+      recBtn.disabled = true;
+    }
+
+    async function resetIntake() {
+      // clear UI
+      chatDiv.innerHTML = '';
+      recBtn.style.display = 'none';
+      recBtn.disabled = false;
+      inputEl.value = '';
+
+      // call reset endpoint
+      const res  = await fetch('/agent/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const json = await res.json();
+      appendMessage(`<strong>Advisor:</strong> ${json.response}`, 'bot');
+    }
+
+    // initial load: start intake
+    sendToAgent(null);
+
+    sendBtn.addEventListener('click', () => {
+      const txt = inputEl.value.trim();
+      if (!txt) return;
+      inputEl.value = '';
+      sendToAgent(txt);
+    });
+
+    inputEl.addEventListener('keyup', e => {
+      if (e.key === 'Enter') sendBtn.click();
+    });
+
+    recBtn.addEventListener('click', getRecommendation);
+    rstBtn.addEventListener('click', resetIntake);
+  </script>
+</body>
+</html>

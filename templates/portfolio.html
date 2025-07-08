@@ -1,0 +1,26 @@
+<!-- templates/portfolio.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Your Portfolio</title>
+</head>
+<body>
+  <h1>Your Portfolio</h1>
+  <table border="1" cellpadding="5">
+    <tr><th>Symbol</th><th>Shares</th></tr>
+    {% for sym, shares in holdings.items() %}
+      <tr><td>{{ sym }}</td><td>{{ shares }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>Add / Update Holding</h2>
+  <form method="post">
+    Symbol: <input name="symbol" required>
+    Shares: <input name="shares" type="number" step="any" required>
+    <button type="submit">Save</button>
+  </form>
+
+  <p><a href="/static/index.html">← Back to Chat</a></p>
+</body>
+</html>
