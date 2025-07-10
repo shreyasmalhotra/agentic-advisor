@@ -558,24 +558,35 @@ const QuestionnaireForm: React.FC<QuestionnaireFormProps> = ({ clientProfile, on
         setIsSubmitting(false);
         return;
       }
-      // Process responses to include "Other" inputs
-      const processedResponses: Record<string, string> = {};
-      questions.forEach(q => {
-        processedResponses[q.id] = getEffectiveResponse(q.id);
+      // Format portfolio data
+      const processedResponses = { ...responses };
+      
+      // Ensure we have the critical fields
+      processedResponses.investment_goal = processedResponses.investment_goal || 'Growth';
+      processedResponses.risk_tolerance = processedResponses.risk_tolerance || '3 - Moderate';
+      processedResponses.time_horizon = processedResponses.time_horizon || '5+ years';
+      
+      // Format positions data
+      const combined: Record<string, Array<{
+        id: string;
+        ticker: string;
+        amount: string;
+        units: 'shares' | 'usd';
+        valid: boolean;
+      }>> = {};
+      
+      // Add structured positions
+      Object.entries(positions).forEach(([assetClass, rows]) => {
+        if (rows.length > 0) {
+          combined[assetClass] = rows.map(row => ({
+            ...row,
+            id: crypto.randomUUID(),
+            valid: true
+          }));
+        }
       });
-
-      // Validate holdings before submission
-      const holdingsResponse = processedResponses['current_assets'];
-      if (holdingsResponse && !validateHoldings(holdingsResponse)) {
-        setValidationError(
-          'Unable to map your portfolio holdings to valid securities. Please select from the predefined options or provide more specific investment details in the "Other" field (e.g., "S&P 500 Index Fund", "Technology Stocks", "Government Bonds").'
-        );
-        setIsSubmitting(false);
-        return;
-      }
-
-      // Combine detailed positions with simple USD amounts
-      const combined: Record<string, PositionRow[]> = { ...positions };
+      
+      // Add simple asset amounts as USD positions
       Object.entries(assetAmounts).forEach(([ac, amtStr]) => {
         if (!simpleAssetClasses.includes(ac)) return;
         const amt = parseFloat(amtStr);
@@ -583,18 +594,18 @@ const QuestionnaireForm: React.FC<QuestionnaireFormProps> = ({ clientProfile, on
         combined[ac] = [
           {
             id: crypto.randomUUID(),
-            ticker: 'USD',
+            ticker: ac.toUpperCase(),
             amount: amtStr,
             units: 'usd',
             valid: true,
           },
         ];
       });
-
-      if (Object.keys(combined).length) {
-        processedResponses['positions'] = JSON.stringify(combined);
-      }
-
+      
+      // Always include positions data, even if empty
+      processedResponses.positions = JSON.stringify(combined);
+      
+      // Save to Supabase
       await axios.post('/submit-questionnaire', {
         session_id: clientProfile.sessionId,
         responses: processedResponses

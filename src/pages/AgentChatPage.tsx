@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { MessageCircle, Send, Bot, User, TrendingUp } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { ClientProfile } from '../App';
+import axios from 'axios';
 
 interface AgentChatPageProps {
   clientProfile: ClientProfile;
@@ -459,7 +460,24 @@ const AgentChatPage: React.FC<AgentChatPageProps> = ({ clientProfile, responses,
   const [isTyping, setIsTyping] = useState(false);
   const [activeAgent, setActiveAgent] = useState<string>('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [sessionData, setSessionData] = useState<Record<string, any>>(responses);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    // Fetch fresh data from Supabase
+    const fetchSessionData = async () => {
+      try {
+        const response = await axios.get(`/agent/session/${clientProfile.sessionId}`);
+        if (response.data?.questionnaire_responses) {
+          setSessionData(response.data.questionnaire_responses);
+        }
+      } catch (error) {
+        console.error('Error fetching session data:', error);
+      }
+    };
+    
+    fetchSessionData();
+  }, [clientProfile.sessionId]);
 
   useEffect(() => {
     // Start with a welcome message from the AI
@@ -467,7 +485,7 @@ const AgentChatPage: React.FC<AgentChatPageProps> = ({ clientProfile, responses,
       id: 'welcome',
       content: `# 🎯 Welcome to your Agentic Portfolio Rebalancing Advisor!
 
-I've received your questionnaire responses and I'm ready to provide personalized portfolio optimization. Based on your **${responses.investment_goal}** goal and **${responses.risk_tolerance}** risk tolerance, I'll use multiple specialized AI agents to help you.
+I've received your questionnaire responses and I'm ready to provide personalized portfolio optimization. Based on your **${sessionData.investment_goal}** goal and **${sessionData.risk_tolerance}** risk tolerance, I'll use multiple specialized AI agents to help you.
 
 ## Here's how I work:
 
@@ -490,7 +508,7 @@ I've received your questionnaire responses and I'm ready to provide personalized
     };
     
     setMessages([welcomeMessage]);
-  }, [responses]);
+  }, [sessionData]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });

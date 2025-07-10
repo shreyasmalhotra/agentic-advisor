@@ -5,16 +5,28 @@ Utility helpers to stream multi-agent responses over Server-Sent Events (SSE).
 `create_agent_stream` orchestrates Data-Fetch → Analysis → Optimization → Explainability
 agents and yields properly formatted `data:` events that the front-end consumes.
 
-All helper functions are nested purely for scoping; this file contains no business
-logic, only streaming glue and minimal sanitisation/cleanup.
+All helper functions are nested purely for scoping.
 """
 import json
 import asyncio
 import logging
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
+from supabase._sync.client import create_client, Client
+
+# Ensure .env is loaded
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 # module-level logger
 logger = logging.getLogger(__name__)
+
+# Initialize Supabase client
+supabase: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"]
+)
 
 async def create_agent_stream(session_id: str, user_message: str, agents: dict):
     """Generate streaming responses from agents with real-time narration"""
@@ -101,14 +113,397 @@ async def create_agent_stream(session_id: str, user_message: str, agents: dict):
             return "✅ **Processing Complete** - I've successfully completed this step."
     
     try:
-        # IMPROVED ROUTING LOGIC - Better keyword detection and autonomous workflow progression
         message_lower = user_message.lower()
-        
+
+        # -------------------------- INTENT ROUTING --------------------------
+        router_intent: str | None = None
+        router_options: list[str] = []
+        intents_list: list[str] = []  # Initialize empty list with explicit type
+        try:
+            router_agent_inst = agents.get('router')  # Provided by caller
+            if router_agent_inst:
+                # Add explicit prompt to ensure consistent format
+                router_prompt = f"Classify this user request: \"{user_message}\". Return ONLY a JSON object."
+                router_raw = router_agent_inst.run(router_prompt)
+                logger.info(f"[ROUTER DEBUG] Raw response: {router_raw}")
+                logger.info(f"[ROUTER DEBUG] Response type: {type(router_raw)}")
+                
+                # First try direct JSON parsing
+                try:
+                    # Convert RunResponse to string if needed
+                    if hasattr(router_raw, 'content'):
+                        router_str = router_raw.content
+                    else:
+                        router_str = str(router_raw)
+                    
+                    # Clean up the string
+                    router_str = router_str.strip()
+                    if router_str.startswith('```') and router_str.endswith('```'):
+                        router_str = router_str[3:-3].strip()
+                    if router_str.startswith('json') or router_str.startswith('JSON'):
+                        router_str = router_str[4:].strip()
+                    
+                    logger.info(f"[ROUTER DEBUG] Cleaned string: {router_str}")
+                    
+                    # Try direct JSON parsing first
+                    try:
+                        router_data = json.loads(router_str)
+                        logger.info(f"[ROUTER DEBUG] Direct JSON parse successful: {router_data}")
+                    except json.JSONDecodeError:
+                        # If that fails, try to find JSON in the string
+                        import re
+                        json_match = re.search(r"\{.*\}", router_str, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group()
+                            logger.info(f"[ROUTER DEBUG] Extracted JSON: {json_str}")
+                            router_data = json.loads(json_str)
+                            logger.info(f"[ROUTER DEBUG] Parsed data: {router_data}")
+                        else:
+                            logger.error("[ROUTER DEBUG] No JSON found in response")
+                            router_data = {"intent": "clarify"}
+                except Exception as e:
+                    logger.error(f"[ROUTER DEBUG] JSON parsing error: {e}")
+                    router_data = {"intent": "clarify"}
+                
+                # Extract intent(s)
+                if isinstance(router_data, dict):
+                    router_intent = router_data.get('intent')
+                    # Ensure router_options is always a list of strings
+                    raw_options = router_data.get('options', [])
+                    router_options = [str(opt) for opt in raw_options] if isinstance(raw_options, list) else []
+                    logger.info(f"[ROUTER DEBUG] Extracted intent: {router_intent}")
+                    logger.info(f"[ROUTER DEBUG] Extracted options: {router_options}")
+                    
+                    if 'intents' in router_data and isinstance(router_data['intents'], list):
+                        # Ensure we have a list of strings
+                        intents_list = [str(i) for i in router_data['intents']]
+                        logger.info(f"[ROUTER DEBUG] Found multiple intents: {intents_list}")
+                    elif 'intent' in router_data and router_data['intent'] != 'clarify':
+                        # Single intent as list
+                        intents_list = [str(router_data['intent'])]
+                        logger.info(f"[ROUTER DEBUG] Found single intent: {router_data['intent']}")
+                    else:
+                        # No valid intents
+                        intents_list = []
+                        logger.info(f"[ROUTER DEBUG] No valid intents found in response: {router_data}")
+                else:
+                    logger.error(f"[ROUTER DEBUG] Router data is not a dict: {router_data}")
+                    router_data = {"intent": "clarify"}
+                    router_intent = "clarify"
+                    intents_list = []
+
+                # Log the final decision
+                logger.info(f"[ROUTER DEBUG] Final decision for '{user_message}': intent={router_intent}, intents={intents_list}")
+
+        except Exception as e:
+            logger.error(f"[ROUTER DEBUG] Router agent failed: {e}")
+            router_intent = "clarify"  # Default to clarify on error
+            router_data = {"intent": "clarify"}
+            intents_list = []
+
+        # ------------------------------------------------------------
+        # Helper to run one agent with nice thinking steps.
+        # ------------------------------------------------------------
+        async def _run_single_agent(agent_key: str, intro: str, think_steps: list[str]):
+            yield create_stream_message('agent_start', agent_key, intro)
+            await asyncio.sleep(0.4)
+            for step in think_steps:
+                yield create_stream_message('agent_thinking', agent_key, step)
+                await asyncio.sleep(0.4)
+            result_raw = agents[agent_key].run(f"Session ID: {session_id}. User request: {user_message}")
+            clean_result = extract_clean_content(result_raw)
+            yield create_stream_message('agent_result', agent_key, clean_result)
+
+        # If router returns a valid intent, SKIP the legacy trigger routing entirely
+        if router_intent and router_intent not in ['clarify', 'unknown', None]:
+            # FETCH DATA - Direct and focused
+            if router_intent == 'fetch_data':
+                yield create_stream_message('agent_start', 'data_fetch', 
+                    '🔍 **Data-Fetch Agent**: Retrieving your current portfolio data...')
+                await asyncio.sleep(0.4)
+                
+                yield create_stream_message('agent_thinking', 'data_fetch', 
+                    '• Accessing your portfolio information...')
+                await asyncio.sleep(0.4)
+                
+                data_result = agents['data_fetch'].run(f"Session ID: {session_id}. Fetch current portfolio data.")
+                yield create_stream_message('agent_response', 'data_fetch', str(data_result))
+                
+            # ANALYZE DRIFT - Quick and focused
+            elif router_intent == 'analyze_drift':
+                # First get fresh data
+                yield create_stream_message('agent_start', 'data_fetch', 
+                    '🔍 **Data-Fetch Agent**: First, let me get your latest portfolio data...')
+                await asyncio.sleep(0.4)
+                
+                data_result = agents['data_fetch'].run(f"Session ID: {session_id}. Quick data refresh for drift analysis.")
+                
+                # Then analyze drift
+                yield create_stream_message('agent_start', 'analysis', 
+                    '📊 **Analysis Agent**: Analyzing your portfolio drift...')
+                await asyncio.sleep(0.4)
+                
+                analysis_result = agents['analysis'].run(f"Session ID: {session_id}. Analyze drift in portfolio.")
+                yield create_stream_message('agent_response', 'analysis', str(analysis_result))
+                
+            # OPTIMIZE PORTFOLIO - Streamlined
+            elif router_intent == 'optimize_portfolio' or 'optimize my allocation' in message_lower:
+                # First, fetch fresh data but with a more focused message
+                yield create_stream_message('agent_start', 'data_fetch', 
+                    '🔍 **Data-Fetch Agent**: First, let me get your latest portfolio data for optimization...')
+                await asyncio.sleep(0.4)
+                
+                yield create_stream_message('agent_thinking', 'data_fetch', 
+                    '• Refreshing your portfolio data...')
+                await asyncio.sleep(0.4)
+                
+                data_result = agents['data_fetch'].run(f"Session ID: {session_id}. Quick data refresh for optimization.")
+                
+                # Get questionnaire data for optimization context
+                try:
+                    resp = (
+                        supabase
+                        .from_("portfolio_sessions")
+                        .select("questionnaire_responses")
+                        .eq("session_id", session_id)
+                        .single()
+                        .execute()
+                    )
+                    q_data = resp.data.get("questionnaire_responses", {}) if resp.data else {}
+                    risk_ctx = q_data.get("risk_tolerance", "")
+                    goal_ctx = q_data.get("investment_goal", "")
+                    horizon_ctx = q_data.get("time_horizon", "")
+                    
+                    logger.info(f"Fetched questionnaire data: risk={risk_ctx}, goal={goal_ctx}, horizon={horizon_ctx}")
+                    
+                    if not risk_ctx or not goal_ctx or not horizon_ctx:
+                        yield create_stream_message('error', 'optimization',
+                            "❌ I couldn't find your questionnaire responses. Please complete the questionnaire first so I know your risk tolerance and goals.")
+                        return
+                        
+                except Exception as e:
+                    logger.error(f"Error handling questionnaire data: {e}")
+                    yield create_stream_message('error', 'optimization',
+                        "❌ I had trouble accessing your questionnaire data. Please try again or complete the questionnaire if you haven't already.")
+                    return
+                
+                # Run optimization agent with questionnaire data
+                yield create_stream_message('agent_start', 'optimization', 
+                    f'⚙️ **Optimization Agent**: Optimizing your portfolio based on your profile:\n'
+                    f'• Risk Tolerance: {risk_ctx}\n'
+                    f'• Investment Goal: {goal_ctx}\n'
+                    f'• Time Horizon: {horizon_ctx}')
+                await asyncio.sleep(0.4)
+                
+                opt_result = agents['optimization'].run(
+                    f"Call optimize_portfolio with:\n"
+                    f"1. session_id='{session_id}'\n"
+                    f"2. risk_tolerance='{risk_ctx}'\n"
+                    f"3. investment_goal='{goal_ctx}'\n"
+                    f"4. time_horizon='{horizon_ctx}'\n\n"
+                    f"Current portfolio data has been fetched and analyzed. Please provide optimized allocation and specific trade recommendations."
+                )
+                yield create_stream_message('agent_response', 'optimization', str(opt_result))
+                
+                # Add explanation
+                yield create_stream_message('agent_start', 'explainability', 
+                    '💡 **Explainability Agent**: Let me explain these recommendations...')
+                await asyncio.sleep(0.4)
+                
+                explain_result = agents['explainability'].run(
+                    f"Explain the optimization results for risk_tolerance='{risk_ctx}' and goal='{goal_ctx}'"
+                )
+                yield create_stream_message('agent_response', 'explainability', str(explain_result))
+                
+            # EXPLAIN RECOMMENDATIONS - More focused
+            elif router_intent == 'explain_recommendations':
+                yield create_stream_message('agent_start', 'explainability', 
+                    '💡 **Explainability Agent**: Let me explain the portfolio recommendations...')
+                await asyncio.sleep(0.4)
+                
+                explain_result = agents['explainability'].run(f"Session ID: {session_id}. Explain the latest recommendations.")
+                yield create_stream_message('agent_response', 'explainability', str(explain_result))
+                
+            # FULL ANALYSIS - Complete workflow
+            elif router_intent == 'full_analysis':
+                # Run the full workflow but with better narration
+                yield create_stream_message('agent_start', 'data_fetch', 
+                    '🔍 **Starting Full Portfolio Analysis**\n\nFirst, let me gather your current data...')
+                await asyncio.sleep(0.4)
+                
+                data_result = agents['data_fetch'].run(f"Session ID: {session_id}. Fetch current portfolio data.")
+                yield create_stream_message('agent_response', 'data_fetch', str(data_result))
+                
+                yield create_stream_message('agent_start', 'analysis', 
+                    '📊 **Analysis Agent**: Now analyzing your portfolio positioning...')
+                await asyncio.sleep(0.4)
+                
+                analysis_result = agents['analysis'].run(f"Session ID: {session_id}. Analyze portfolio drift and risk exposure.")
+                yield create_stream_message('agent_response', 'analysis', str(analysis_result))
+                
+                yield create_stream_message('agent_start', 'optimization', 
+                    '⚙️ **Optimization Agent**: Generating optimal allocation...')
+                await asyncio.sleep(0.4)
+                
+                opt_result = agents['optimization'].run(f"Session ID: {session_id}. Optimize portfolio based on analysis.")
+                yield create_stream_message('agent_response', 'optimization', str(opt_result))
+                
+                yield create_stream_message('agent_start', 'explainability', 
+                    '💡 **Explainability Agent**: Let me explain these recommendations...')
+                await asyncio.sleep(0.4)
+                
+                explain_result = agents['explainability'].run(f"Session ID: {session_id}. Explain the recommendations.")
+                yield create_stream_message('agent_response', 'explainability', str(explain_result))
+                
+        # CLARIFICATION NEEDED
+        elif router_intent == 'clarify':
+            # Ask the user for clarification with suggested commands
+            options = router_options if router_options else [
+                'Show my portfolio data',
+                'Analyze my portfolio drift',
+                'Optimize my allocation',
+                'Explain the recommendations',
+                'Run a full portfolio analysis'
+            ]
+            opts_txt = "\n".join(f"• {opt}" for opt in options)
+            yield create_stream_message('agent_response', 'router', 
+                "I wasn't completely sure what you wanted. Here are a few things I can do:\n\n" + 
+                opts_txt + "\n\nPlease let me know which one you'd like!"
+            )
+            
+        # UNKNOWN INTENT - Fall back to full analysis
+        else:
+            # Default to full analysis with clear explanation
+            yield create_stream_message('agent_response', 'router',
+                "I'll run a complete portfolio analysis to help you understand your current situation.\n\n"
+                "This will include:\n"
+                "• Current portfolio data\n"
+                "• Drift analysis\n"
+                "• Optimization recommendations\n"
+                "• Plain-English explanations\n\n"
+                "Starting analysis now..."
+            )
+            await asyncio.sleep(0.4)
+            
+            # Run data fetch
+            yield create_stream_message('agent_start', 'data_fetch', 
+                '🔍 **Data-Fetch Agent**: First, let me gather your current portfolio data...')
+            await asyncio.sleep(0.4)
+            
+            data_result = agents['data_fetch'].run(f"Session ID: {session_id}. Fetch current portfolio data.")
+            yield create_stream_message('agent_response', 'data_fetch', str(data_result))
+            
+            # Run analysis
+            yield create_stream_message('agent_start', 'analysis', 
+                '📊 **Analysis Agent**: Now analyzing your portfolio positioning...')
+            await asyncio.sleep(0.4)
+            
+            analysis_result = agents['analysis'].run(f"Session ID: {session_id}. Analyze portfolio drift and risk exposure.")
+            yield create_stream_message('agent_response', 'analysis', str(analysis_result))
+            
+            # Run optimization
+            yield create_stream_message('agent_start', 'optimization', 
+                '⚙️ **Optimization Agent**: Generating optimal allocation...')
+            await asyncio.sleep(0.4)
+            
+            opt_result = agents['optimization'].run(f"Session ID: {session_id}. Optimize portfolio based on analysis.")
+            yield create_stream_message('agent_response', 'optimization', str(opt_result))
+            
+            # Add explanation
+            yield create_stream_message('agent_start', 'explainability', 
+                '💡 **Explainability Agent**: Let me explain these recommendations...')
+            await asyncio.sleep(0.4)
+            
+            explain_result = agents['explainability'].run(f"Session ID: {session_id}. Explain the recommendations.")
+            yield create_stream_message('agent_response', 'explainability', str(explain_result))
+
+        # Only fall through to legacy routing if router completely failed
+        if router_intent in ['clarify', 'unknown', None]:
+            # Ask for clarification
+            opts = router_options or ['Show portfolio data', 'Analyze drift', 'Optimize allocation', 'Explain recommendations']
+            opts_text = '\n'.join(f"• {o}" for o in opts)
+            yield create_stream_message('agent_start', 'orchestrator', "🤔 I wasn't sure what you wanted. Here are some things I can help with:\n" + opts_text)
+            yield create_stream_message('agent_complete', 'orchestrator', 'Please tell me which one sounds right!')
+            import json as _json
+            yield f"data: {_json.dumps({'type': 'stream_end'})}\n\n"
+            return
+
+        # ------------------------------------
+        # Multi-intent custom sequence support
+        # ------------------------------------
+        if intents_list:
+            # If the router explicitly asked for full_analysis, let existing block handle
+            if 'full_analysis' in intents_list:
+                router_intent = 'full_analysis'
+            else:
+                # Execute sequence respecting dependencies
+                has_data = False
+                for intent_item in intents_list:
+                    if intent_item in ('analyze_drift', 'optimize_portfolio') and not has_data:
+                        # fetch fresh data first
+                        async for m in _run_single_agent('data_fetch', '🔍 **Data-Fetch Agent**: Retrieving your latest portfolio data...', ['• Refreshing database records...', '• Pulling live prices...']):
+                            yield m
+                        has_data = True
+
+                    if intent_item == 'fetch_data':
+                        async for m in _run_single_agent('data_fetch', '🔍 **Data-Fetch Agent**: Retrieving your portfolio data and current market prices...', ['• Accessing database...', '• Fetching live prices...']):
+                            yield m
+                        has_data = True
+                    elif intent_item == 'analyze_drift':
+                        async for m in _run_single_agent('analysis', '📊 **Analysis Agent**: Analyzing your portfolio drift...', ['• Loading your positions...', '• Calculating drift...']):
+                            yield m
+                    elif intent_item == 'optimize_portfolio':
+                        async for m in _run_single_agent('optimization', '⚙️ **Optimization Agent**: Optimizing your portfolio allocation...', ['• Loading risk preferences...', '• Running optimization...']):
+                            yield m
+                    elif intent_item == 'explain_recommendations':
+                        async for m in _run_single_agent('explainability', '💡 **Explainability Agent**: Explaining the rationale behind the recommendations...', ['• Reviewing prior recommendations...', '• Crafting explanation...']):
+                            yield m
+                # Finish stream
+                import json as _json
+                yield create_stream_message('agent_complete', 'orchestrator', '✅ Sequence complete. Let me know what else I can help with!')
+                yield f"data: {_json.dumps({'type': 'stream_end'})}\n\n"
+                return
+
+        if router_intent in ['fetch_data', 'analyze_drift', 'optimize_portfolio', 'explain_recommendations']:
+            # Always refresh data first unless the user explicitly only asked for data
+            if router_intent != 'fetch_data':
+                async for m in _run_single_agent('data_fetch', '🔍 **Data-Fetch Agent**: Retrieving your latest portfolio data...', ['• Refreshing database records...', '• Pulling live prices...']):
+                    yield m
+
+            if router_intent == 'fetch_data':
+                async for m in _run_single_agent('data_fetch', '🔍 **Data-Fetch Agent**: Retrieving your portfolio data and current market prices...', ['• Accessing database...', '• Fetching live prices...']):
+                    yield m
+            elif router_intent == 'analyze_drift':
+                async for m in _run_single_agent('analysis', '📊 **Analysis Agent**: Analyzing your portfolio drift...', ['• Loading your positions...', '• Calculating drift...']):
+                    yield m
+            elif router_intent == 'optimize_portfolio':
+                async for m in _run_single_agent('optimization', '⚙️ **Optimization Agent**: Optimizing your portfolio allocation...', ['• Loading risk preferences...', '• Running optimization...']):
+                    yield m
+            elif router_intent == 'explain_recommendations':
+                async for m in _run_single_agent('explainability', '💡 **Explainability Agent**: Explaining the rationale behind the recommendations...', ['• Reviewing prior recommendations...', '• Crafting explanation...']):
+                    yield m
+
+            import json as _json
+            yield create_stream_message('agent_complete', 'orchestrator', '✅ Task complete. Let me know what you would like to do next!')
+            yield f"data: {_json.dumps({'type': 'stream_end'})}\n\n"
+            return
+
+        elif router_intent in ['clarify', 'unknown', None]:
+            # Ask for clarification
+            opts = router_options or ['Show portfolio data', 'Analyze drift', 'Optimize allocation', 'Explain recommendations']
+            opts_text = '\n'.join(f"• {o}" for o in opts)
+            yield create_stream_message('agent_start', 'orchestrator', "🤔 I wasn't sure what you wanted. Here are some things I can help with:\n" + opts_text)
+            yield create_stream_message('agent_complete', 'orchestrator', 'Please tell me which one sounds right!')
+            import json as _json
+            yield f"data: {_json.dumps({'type': 'stream_end'})}\n\n"
+            return
+
+        # ---------------------- LEGACY TRIGGER ROUTING ----------------------
         # Check for full workflow triggers
         full_workflow_triggers = [
             "start", "begin", "analysis", "full", "complete", "comprehensive",
             "go ahead", "next step", "continue", "proceed", "do next",
-            "diversify", "optimize", "rebalance", "improve", "better performance"
+            "diversify", "improve", "better performance"
         ]
         
         # Check for analysis/drift specific triggers  
@@ -140,14 +535,14 @@ async def create_agent_stream(session_id: str, user_message: str, agents: dict):
             from app import supabase_fetch  # type: ignore
 
             q_data = supabase_fetch(session_id) or {}  # type: ignore
-            risk_tolerance_str: str = q_data.get("risk_tolerance", "3 - Moderate")
-            investment_goal_str: str = q_data.get("investment_goal", "Growth")
-            time_horizon_str: str = q_data.get("time_horizon", "5+ years")
+            risk_ctx: str = q_data.get("risk_tolerance", "3 - Moderate")
+            goal_ctx: str = q_data.get("investment_goal", "Growth")
+            horizon_ctx: str = q_data.get("time_horizon", "5+ years")
         except Exception:
             # Fallback defaults if anything goes wrong
-            risk_tolerance_str = "3 - Moderate"
-            investment_goal_str = "Growth"
-            time_horizon_str = "5+ years"
+            risk_ctx = "3 - Moderate"
+            goal_ctx = "Growth"
+            horizon_ctx = "5+ years"
 
         if any(trigger in message_lower for trigger in full_workflow_triggers) or \
            any(trigger in message_lower for trigger in analysis_triggers + optimization_triggers):
@@ -236,9 +631,12 @@ async def create_agent_stream(session_id: str, user_message: str, agents: dict):
             
             # Run optimization agent – pass the actual user parameters we just fetched
             opt_result = agents['optimization'].run(
-                f"Call optimize_portfolio with session_id='{session_id}', risk_tolerance='{risk_tolerance_str}', "
-                f"investment_goal='{investment_goal_str}', time_horizon='{time_horizon_str}'. "
-                "Provide the optimized allocation breakdown and concrete trade list."
+                f"Call optimize_portfolio with:\n"
+                f"1. session_id='{session_id}'\n"
+                f"2. risk_tolerance='{risk_ctx}'\n"  # Make sure to pass as string
+                f"3. investment_goal='{goal_ctx}'\n"
+                f"4. time_horizon='{horizon_ctx}'\n\n"
+                f"Current portfolio data has been fetched and analyzed. Please provide optimized allocation and specific trade recommendations."
             )
             clean_opt_result = extract_clean_content(opt_result)
             logger.debug("Optimization result: %s", clean_opt_result)
@@ -271,8 +669,8 @@ async def create_agent_stream(session_id: str, user_message: str, agents: dict):
             explain_prompt = (
                 "Use explain_recommendations tool. "
                 f"Optimization result: {summary}. "
-                f"Risk tolerance: {risk_tolerance_str}. "
-                f"Investment goal: {investment_goal_str}. "
+                f"Risk tolerance: {risk_ctx}. "
+                f"Investment goal: {goal_ctx}. "
                 "Explain why this allocation makes sense in plain English."
             )
             explain_result = agents['explainability'].run(explain_prompt)

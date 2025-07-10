@@ -138,12 +138,38 @@ def fetch_portfolio_data(session_id: str, holdings: str) -> str:
             shares_lookup: dict[str, float] = {}
             cash_positions: list[str] = []
             position_details: list[str] = []
+            unmapped_tickers: list[str] = []
+
+            # Asset class to ticker mapping
+            asset_class_map = {
+                "REAL ESTATE (REITS)": ("VNQ", "Vanguard Real Estate ETF"),
+                "REITS": ("VNQ", "Vanguard Real Estate ETF"),
+                "US EQUITY": ("SPY", "S&P 500 ETF"),
+                "US STOCKS": ("SPY", "S&P 500 ETF"),
+                "INTERNATIONAL EQUITY": ("VEA", "Vanguard Developed Markets ETF"),
+                "EMERGING MARKETS": ("VWO", "Vanguard Emerging Markets ETF"),
+                "BONDS": ("BND", "Vanguard Total Bond Market ETF"),
+                "FIXED INCOME": ("BND", "Vanguard Total Bond Market ETF")
+            }
 
             for asset_class, rows in structured_positions.items():
                 for row in rows:
                     ticker = row.get("ticker", "").upper()
                     if not ticker:
                         continue
+                    
+                    # Handle special cases for asset classes
+                    if ticker == "REAL ESTATE (REITS)" or ticker == "REITS":
+                        # Map to popular REIT ETFs
+                        ticker = "VNQ"  # Vanguard Real Estate ETF
+                        position_details.append(f"{ticker}: Vanguard Real Estate ETF (mapped from REITs)")
+                    elif ticker == "US EQUITY" or ticker == "US STOCKS":
+                        # Map to S&P 500 ETF
+                        ticker = "SPY"  # SPDR S&P 500 ETF
+                        position_details.append(f"{ticker}: S&P 500 ETF (mapped from US Equity)")
+                    else:
+                        position_details.append(f"{ticker}: {asset_class}")
+                    
                     amount = float(row.get("amount", 0)) if row.get("amount") else 0.0
                     units = row.get("units", "shares")
                     tickers.append(ticker)
@@ -152,7 +178,17 @@ def fetch_portfolio_data(session_id: str, holdings: str) -> str:
                     else:  # usd
                         # store negative value to mark as fixed usd value
                         shares_lookup[ticker] = shares_lookup.get(ticker, 0) - amount  # negative means USD
-                    position_details.append(f"{ticker}: {asset_class}")
+
+            # If we found any unmapped tickers that need attention
+            if unmapped_tickers:
+                return (
+                    "❌ Some of your positions need attention:\n\n"
+                    + "\n".join(f"• {t}: Please provide a valid ticker symbol" for t in unmapped_tickers)
+                    + "\n\nFor Real Estate (REITs), you can use VNQ, SCHH, or IYR."
+                    + "\nFor US Equity, you can use SPY, VOO, or VTI."
+                    + "\nFor International, you can use VEA, VXUS, or IXUS."
+                    + "\nFor Bonds, you can use BND, AGG, or TLT."
+                )
         else:
             # No structured position data – return a clear error instead of guessing.
             return (
@@ -459,7 +495,53 @@ def analyze_portfolio_drift(session_id: str, risk_tolerance: str) -> str:
 def optimize_portfolio(session_id: str, risk_tolerance: str, investment_goal: str, time_horizon: str) -> str:
     """Generate target allocation & concrete trade tilts based on current bucket weights vs strategic targets."""
     try:
-        risk_level = int(risk_tolerance.split()[0]) if risk_tolerance and risk_tolerance[0].isdigit() else 3
+        # First, explicitly log what we received
+        logger.info(f"Optimize called with: session={session_id}, risk={risk_tolerance}, goal={investment_goal}, horizon={time_horizon}")
+
+        # If risk_tolerance wasn't provided, try to get it from the database
+        if not risk_tolerance or risk_tolerance == "None":
+            logger.info("No risk_tolerance provided, fetching from database...")
+            resp = (
+                supabase
+                .from_("portfolio_sessions")
+                .select("questionnaire_responses")
+                .eq("session_id", session_id)
+                .limit(1)
+                .execute()
+            )
+            
+            # Add detailed logging
+            logger.info(f"Database response: {resp.data if resp else 'No response'}")
+            
+            if not resp.data:
+                return "❌ Could not find your session data. Please ensure you've completed the questionnaire."
+            
+            q = resp.data[0].get("questionnaire_responses", {}) if resp.data else {}
+            logger.info(f"Questionnaire data found: {q}")
+            
+            # Extract questionnaire fields with defaults
+            risk_tolerance = q.get("risk_tolerance", "3 - Moderate")
+            investment_goal = q.get("investment_goal", "Growth")
+            time_horizon = q.get("time_horizon", "5+ years")
+            
+            logger.info(f"Extracted from DB: risk={risk_tolerance}, goal={investment_goal}, horizon={time_horizon}")
+            
+            if not risk_tolerance or risk_tolerance == "None":
+                return (
+                    "❌ Risk tolerance information is missing. Please complete the questionnaire first.\n\n"
+                    "Your questionnaire data:\n"
+                    f"• Risk Tolerance: {risk_tolerance}\n"
+                    f"• Investment Goal: {investment_goal}\n"
+                    f"• Time Horizon: {time_horizon}"
+                )
+
+        # Extract risk level number (1-5)
+        try:
+            risk_level = int(risk_tolerance.split()[0]) if risk_tolerance and risk_tolerance[0].isdigit() else 3
+            logger.info(f"Parsed risk level: {risk_level}")
+        except Exception as e:
+            logger.error(f"Error parsing risk level from '{risk_tolerance}': {e}")
+            risk_level = 3  # Default to moderate
 
         # Load positions JSON
         resp = (
@@ -679,6 +761,63 @@ explainability_agent = Agent(
     show_tool_calls=True,
 )
 
+# Router / Intent Agent
+router_agent = Agent(
+    model=OpenAIChat(
+        id="gpt-4-0613",
+        api_key=os.environ["OPENAI_API_KEY"],
+        temperature=0,  # Make responses deterministic
+        max_tokens=50  # Keep responses short and focused
+    ),
+    tools=[],
+    instructions=[
+        "You are the Intent Router for the portfolio advisor.\n\n"
+        "Your ONLY job is to classify user messages into one or more intents.\n\n"
+        "VALID INTENTS:\n"
+        "• optimize_portfolio      – run optimization\n"
+        "• analyze_drift          – run drift analysis\n"
+        "• fetch_data            – show current portfolio data\n"
+        "• explain_recommendations – explain trades\n"
+        "• full_analysis         – run complete workflow\n\n"
+        "EXACT MATCH RULES:\n"
+        "• \"optimize my allocation\" → optimize_portfolio\n"
+        "• \"optimize my allocations\" → optimize_portfolio\n"
+        "• \"optimize allocation\" → optimize_portfolio\n\n"
+        "KEYWORD RULES (match any variation/misspelling):\n"
+        "• optimize_portfolio: optimize, optimise, rebalance, allocation, allocate, portfolio\n"
+        "• analyze_drift: drift, balance, deviation, off-track\n"
+        "• fetch_data: data, holdings, show, portfolio\n"
+        "• explain_recommendations: explain, why, reason\n"
+        "• full_analysis: full, complete, everything\n\n"
+        "SPECIAL RULES:\n"
+        "• If message contains risk tolerance, investment goals, or time horizon → optimize_portfolio\n"
+        "• Examples of risk/goal messages that should map to optimize_portfolio:\n"
+        "  - \"My risk tolerance is high\"\n"
+        "  - \"Want to make more money\"\n"
+        "  - \"Time horizon is 3 years\"\n"
+        "  - Any combination of risk/goals/horizon information\n\n"
+        "RESPONSE FORMAT:\n"
+        "You MUST respond with ONLY a JSON object in one of these formats:\n"
+        "1. Single intent: {\"intent\": \"optimize_portfolio\"}\n"
+        "2. Multiple intents: {\"intents\": [\"fetch_data\", \"analyze_drift\"]}\n"
+        "3. Unclear request: {\"intent\": \"clarify\"}\n\n"
+        "CRITICAL: Do not include ANY other text, markdown, or explanation. Return ONLY the JSON object.\n\n"
+        "EXAMPLES:\n"
+        "Input: \"optimize my allocation\"\n"
+        "Output: {\"intent\": \"optimize_portfolio\"}\n\n"
+        "Input: \"optimize my allocations\"\n"
+        "Output: {\"intent\": \"optimize_portfolio\"}\n\n"
+        "Input: \"show data and check drift\"\n"
+        "Output: {\"intents\": [\"fetch_data\", \"analyze_drift\"]}\n\n"
+        "Input: \"My risk tolerance is high and time horizon is 5 years\"\n"
+        "Output: {\"intent\": \"optimize_portfolio\"}\n\n"
+        "Input: \"hello\"\n"
+        "Output: {\"intent\": \"clarify\"}"
+    ],
+    markdown=False,
+    show_tool_calls=False
+)
+
 # Orchestrator Agent - Manages the entire workflow
 orchestrator_agent = Agent(
     model=OpenAIChat(id="gpt-4-0613", api_key=os.environ["OPENAI_API_KEY"]),
@@ -761,6 +900,7 @@ async def agent_chat_stream(request: Request):
         
         # Create agents dictionary for streaming function
         agents = {
+            'router': router_agent,  # NEW – intent detection
             'data_fetch': data_fetch_agent,
             'analysis': analysis_agent,
             'optimization': optimization_agent,
@@ -797,54 +937,58 @@ async def agent_chat(request: Request):
         if not session:
             return {"response": "Session not found. Please start a new questionnaire."}
         
-        # Determine which agent should handle the request
-        if "start analysis" in user_message.lower() or "begin" in user_message.lower():
-            # Start the full multi-agent workflow
-            try:
-                result = orchestrator_agent.run(f"Session ID: {session_id}. User says: {user_message}")
-                response = str(result)
-            except Exception as e:
-                print(f"Error with orchestrator agent: {e}")
-                response = "I'm having trouble starting the full analysis right now. Let me try a simpler approach."
-        
-        elif "data" in user_message.lower() or "portfolio" in user_message.lower():
-            # Use data fetch agent
+        # ---------------- New dynamic routing via router_agent ----------------
+        import json, re  # ensure available
+        try:
+            router_raw = router_agent.run(user_message)
+            m = re.search(r"\{.*\}", str(router_raw), re.DOTALL)
+            router_parsed = json.loads(m.group()) if m else {}
+            intent_flag = router_parsed.get("intent")
+        except Exception:
+            intent_flag = None
+
+        if intent_flag == 'fetch_data':
             try:
                 result = data_fetch_agent.run(f"Session ID: {session_id}. User request: {user_message}")
                 response = str(result)
             except Exception as e:
-                print(f"Error with data fetch agent: {e}")
                 response = "I'm having trouble fetching your portfolio data right now."
-        
-        elif "analysis" in user_message.lower() or "drift" in user_message.lower():
-            # Use analysis agent
+        elif intent_flag == 'analyze_drift':
             try:
                 result = analysis_agent.run(f"Session ID: {session_id}. User request: {user_message}")
                 response = str(result)
-            except Exception as e:
-                print(f"Error with analysis agent: {e}")
-                response = "I'm having trouble analyzing your portfolio right now."
-        
-        elif "optimize" in user_message.lower() or "recommend" in user_message.lower():
-            # Use optimization agent
+            except Exception:
+                response = "I'm having trouble analyzing your portfolio drift right now."
+        elif intent_flag == 'optimize_portfolio':
             try:
                 result = optimization_agent.run(f"Session ID: {session_id}. User request: {user_message}")
                 response = str(result)
-            except Exception as e:
-                print(f"Error with optimization agent: {e}")
+            except Exception:
                 response = "I'm having trouble optimizing your portfolio right now."
-        
-        elif "explain" in user_message.lower() or "why" in user_message.lower():
-            # Use explainability agent
+        elif intent_flag == 'explain_recommendations':
             try:
                 result = explainability_agent.run(f"Session ID: {session_id}. User request: {user_message}")
                 response = str(result)
-            except Exception as e:
-                print(f"Error with explainability agent: {e}")
+            except Exception:
                 response = "I'm having trouble explaining the recommendations right now."
-        
+        elif intent_flag == 'full_analysis':
+            try:
+                result = orchestrator_agent.run(f"Session ID: {session_id}. User says: {user_message}")
+                response = str(result)
+            except Exception:
+                response = "I'm having trouble starting the full analysis right now."
+        elif intent_flag == 'clarify':
+            # Ask the user for clarification with suggested commands
+            options = router_parsed.get('options', [
+                'Show my portfolio data', 'Analyze my drift', 'Optimize my allocation', 'Explain why'
+            ])
+            opts_txt = "\n".join(f"• {opt}" for opt in options)
+            response = (
+                "I wasn't completely sure what you wanted. Here are a few things I can do:\n" + opts_txt +
+                "\nPlease let me know which one you'd like!"
+            )
         else:
-            # Default to orchestrator for general queries
+            # Fallback to legacy keyword routing if router uncertain
             try:
                 result = orchestrator_agent.run(f"Session ID: {session_id}. User says: {user_message}")
                 response = str(result)
@@ -907,6 +1051,36 @@ async def submit_questionnaire(request: Request):
     except Exception as e:
         print(f"Error submitting questionnaire: {e}")
         return {"success": False, "message": f"Failed to save responses: {str(e)}"}
+
+# 15) Session data endpoint
+@app.get("/agent/session/{session_id}")
+async def get_session_data(session_id: str):
+    """Get session data including questionnaire responses."""
+    try:
+        session = get_session(session_id)
+        if not session:
+            return {"success": False, "message": "Session not found"}
+        
+        # Log session data access
+        save_chat_message(
+            session_id,
+            "system",
+            "Session data accessed",
+            {"timestamp": datetime.utcnow().isoformat()}
+        )
+        
+        return {
+            "success": True,
+            "session_id": session_id,
+            "questionnaire_responses": session.get("questionnaire_responses", {}),
+            "status": session.get("status"),
+            "created_at": session.get("created_at"),
+            "completed_at": session.get("completed_at")
+        }
+        
+    except Exception as e:
+        print(f"Error getting session data: {e}")
+        return {"success": False, "message": f"Failed to get session data: {str(e)}"}
 
 # ---------------------------------------------------------------------------
 # Compatibility endpoint for the original CRA front-end
